@@ -27,6 +27,12 @@ module and_gate_using_mux
   // Task:
   // Implement and gate using instance(s) of mux,
   // constants 0 and 1, and wire connections
-
+  mux a_is_select_b_is_value
+  (
+    .d0(a),
+    .d1(b),
+    .sel(a),
+    .y(o)
+  );
 
 endmodule
