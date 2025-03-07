@@ -6,8 +6,137 @@ waveform_viewer="gtkwave"
 # waveform_viewer="surfer"
 
 #-----------------------------------------------------------------------------
+# Utility functions
+#-----------------------------------------------------------------------------
 
-simulate_rtl()
+find_path()
+{
+    search_path=$1
+    i=0
+
+    while [ "$i" -lt 3 ]
+    do
+        [ -d "$search_path" ] && break
+        search_path=../$search_path
+        i=$((i + 1))
+    done
+
+    if [ -d "$search_path" ]
+    then
+        echo "$search_path"
+    else
+        echo "none"
+    fi
+}
+
+#-----------------------------------------------------------------------------
+
+import_files()
+{
+    import=$(echo "$1" | sed 's/common/import/g')
+
+    if ! [ -d "$import/original/cvw" ]
+    then
+        mkdir -p "$import"
+        git clone --depth 1 https://github.com/openhwgroup/cvw.git "$import/original/cvw"
+    fi
+
+    rm    -rf "$import/preprocessed"
+    mkdir -p  "$import/preprocessed/cvw"
+
+    cp -r  \
+       "$import/original/cvw/config/rv32gc/config.vh"              \
+       "$import/original/cvw/config/shared/BranchPredictorType.vh" \
+       "$import/original/cvw/config/shared/config-shared.vh"       \
+       "$import/original/cvw/src/fpu"/*/*                          \
+       "$import/original/cvw/src/fpu"/*.*                          \
+       "$import/original/cvw/src/generic"/*.*                      \
+       "$import/original/cvw/src/generic/flop"/*.*                 \
+       "$import/preprocessed/cvw"
+
+    sed -i 's/#(P) //g' "$import/preprocessed/cvw/"*
+    sed -i 's/P\./  /g' "$import/preprocessed/cvw/"*
+    sed -i 's/import cvw::\*;  #(parameter cvw_t P) //g' "$import/preprocessed/cvw"/*
+
+    sed -i 's/, parameter type TYPE=logic \[WIDTH-1:0\]//g' \
+        "$import/preprocessed/cvw/flopenl.sv"
+
+    sed -i 's/ TYPE / logic [WIDTH-1:0] /g' \
+        "$import/preprocessed/cvw/flopenl.sv"
+
+    sed -i 's/module fmalza #(WIDTH, NF) /module fmalza #(parameter WIDTH = 0, NF = 0) /g' \
+        "$import/preprocessed/cvw/fmalza.sv"
+
+    sed -i 's/(parameter FLEN)/(parameter FLEN=64)/g' \
+        "$import/preprocessed/cvw/fregfile.sv"
+
+    sed -i 's/ var / /g' \
+        "$import/preprocessed/cvw/or_rows.sv"
+}
+
+#-----------------------------------------------------------------------------
+
+run_icarus()
+{
+    extra_args=$1
+
+    # $extra_args has to be unquoted here, otherwise it would pass as a single argument
+    # shellcheck disable=SC2086
+    iverilog -g2012                  \
+             -o sim.out              \
+             $extra_args             \
+             >> log.txt 2>&1         \
+             && vvp sim.out          \
+             >> log.txt 2>&1
+
+}
+
+#-----------------------------------------------------------------------------
+
+run_verilator()
+{
+    extra_args=$1
+
+    # $extra_args has to be unquoted here, otherwise it would pass as a single argument
+    # shellcheck disable=SC2086
+    verilator --lint-only      \
+              -Wall            \
+              --timing         \
+              $lint_rules_path \
+              $extra_args      \
+              >> lint.txt 2>&1
+
+}
+
+#-----------------------------------------------------------------------------
+
+prompt_to_clone_if_repo_not_found()
+{
+    common_path=$1
+    import_path=$(find_path "../import/preprocessed/cvw")
+
+    if [ "$import_path" = "none" ]
+    then
+        printf "You need to import external files in order to verify some exercises.\n"
+        printf "Needed files are located at https://github.com/openhwgroup/cvw\n"
+        printf "Clone third-party repository from GitHub? [y/N] "
+
+        read -r input
+
+        if [ "$input" = "y" ] || [ "$input" = "Y" ]
+        then
+            import_files "$common_path"
+            find_path "../import/preprocessed/cvw"
+        else
+            return 1
+        fi
+    fi
+    return 0
+}
+
+#-----------------------------------------------------------------------------
+
+check_iverilog_executable()
 {
     if ! command -v iverilog > /dev/null 2>&1
     then
@@ -21,50 +150,142 @@ simulate_rtl()
         read -r enter
         exit 1
     fi
+}
 
+#-----------------------------------------------------------------------------
+
+check_verilator_setup()
+{
+    if ! command -v verilator > /dev/null 2>&1
+    then
+        printf "%s\n"                                                             \
+               "ERROR [-l | --lint]: Verilator is not in the path"                \
+               "or cannot be run."                                                \
+               "See README.md file in the package directory for the instructions" \
+               "how to install Verilator."                                        \
+               "Press enter"
+
+        read -r enter
+        exit 1
+    fi
+
+    lint_rules_path="../.lint_rules.vlt"
+    i=0
+
+    while [ "$i" -lt 3 ]
+    do
+        [ -f $lint_rules_path ] && break
+        lint_rules_path=../$lint_rules_path
+        i=$((i + 1))
+    done
+
+    if ! [ -f $lint_rules_path ]
+    then
+        printf "%s\n"                                             \
+               "ERROR: Config file for Verilator cannot be found" \
+               "Press enter"
+
+        read -r enter
+        exit 1
+    fi
+}
+
+#-----------------------------------------------------------------------------
+
+prepare_wally_env()
+{
+    choice=$1
+    if [ "$choice" -eq 0 ]
+    then
+        prompt_to_clone_if_repo_not_found "$common_path"
+        choice=$?
+
+        if [ $choice -eq 0 ]
+        then
+            extra_args="$extra_args
+                        -I $import_path
+                        -I $common_path
+                        $import_path/config.vh
+                        $import_path/*.sv
+                        $common_path/wally_fpu/*.sv
+                        $d*.sv"
+        fi
+    fi
+
+    return "$choice"
+}
+
+#-----------------------------------------------------------------------------
+# Main functions
+#-----------------------------------------------------------------------------
+
+simulate_rtl()
+{
+    check_iverilog_executable
+
+    rm -f sim.out
     rm -f dump.vcd
     rm -f log.txt
 
-    if [ -d testbenches ]
-    then
-        iverilog -g2005-sv        \
-                 -o sim.out       \
-                 -I testbenches   \
-                 testbenches/*.sv \
-                 black_boxes/*.sv \
-                 ./*.sv           \
-                 >> log.txt 2>&1  \
-                 && vvp sim.out   \
-                 >> log.txt 2>&1
+    common_path=$(find_path "../common")
+    extra_args=""
+    choice=0
 
-        rm -f sim.out
-    elif [ -f tb.sv ]
+    if [ -f tb.sv ]
     then
-        iverilog -g2005-sv       \
-                 -o sim.out      \
-                 ./*sv           \
-                 >> log.txt 2>&1 \
-                 && vvp sim.out  \
-                 >> log.txt 2>&1
+        # Testbench is in the same directory with the script (HW 05)
+        extra_args="$extra_args ./*.sv"
+        run_icarus "$extra_args"
+    elif [ -d "testbenches" ]
+    then
+        # It is isqrt exercise
+        extra_args="$extra_args
+                    -I $common_path
+                    -I testbenches
+                    testbenches/*.sv
+                    $common_path/isqrt/*.sv
+                    *.sv"
 
-        rm -f sim.out
+        run_icarus "$extra_args"
     else
+        # Enter each directory in homework
         for d in */
         do
-            if [ ! -d "$d"testbenches ]
-            then
-                iverilog -g2005-sv          \
-                         -o "$d"sim.out     \
-                         "$d"*.sv           \
-                         >> log.txt 2>&1    \
-                         && vvp "$d"sim.out \
-                         >> log.txt 2>&1
+            extra_args=""
 
-                rm -f "$d"sim.out
+            if [ -d "$d"testbenches ]
+            then
+            # It is isqrt exercise
+            extra_args="$extra_args
+                        -I $common_path
+                        -I $d
+                        -I ${d}testbenches
+                        ${d}testbenches/*.sv
+                        $common_path/isqrt/*.sv
+                        $d*.sv"
+            elif [ -f "$d"testbench.sv ] && grep -q "realtobits" "$d"testbench.sv;
+            then
+                # It is an exercise with Wally CPU blocks
+                prepare_wally_env "$choice"
+
+                # Don't add solution_submodules if we haven't imported Wally CPU
+                if [ -d "$d"solution_submodules ] && [ "$choice" -eq 0 ]
+                then
+                    extra_args="$extra_args
+                                -I  ${d}solution_submodules
+                                ${d}solution_submodules/*.sv"
+                fi
+
+            else
+                # It is a regular exercise with a testbench in each dir
+                extra_args="$extra_args
+                            -I $common_path
+                            $d*.sv"
             fi
+            # Run icarus with specific arguments
+            run_icarus "$extra_args"
         done
     fi
-
 
     # Don't print iverilog warning about not supporting constant selects
     sed -i '/sorry: constant selects/d' log.txt
@@ -76,88 +297,85 @@ simulate_rtl()
 
 lint_code()
 {
-    lint_rules_path="../.lint_rules.vlt"
+    common_path=$(find_path "../common")
+    check_verilator_setup
 
-    if command -v verilator > /dev/null 2>&1
+    rm -f lint.txt
+
+    extra_args="-I$common_path"
+
+    if [ -f tb.sv ]
     then
-        i=0
+        extra_args="$extra_args
+                    *.sv
+                    -top tb"
 
-        while [ "$i" -lt 3 ]
+        run_verilator "$extra_args"
+    elif [ -d testbenches ]
+    then
+        extra_args="$extra_args
+                    -I$common_path/isqrt
+                    -Itestbenches
+                    testbenches/*.sv
+                    *.sv
+                    -top tb"
+
+        run_verilator "$extra_args"
+    else
+        for d in */
         do
-            [ -f $lint_rules_path ] && break
-            lint_rules_path=../$lint_rules_path
-            i=$((i + 1))
-        done
+            extra_args="-I$common_path"
 
-        if ! [ -f $lint_rules_path ]
-        then
-            printf "%s\n"                                             \
-                   "ERROR: Config file for Verilator cannot be found" \
-                   "Press enter"
+            {
+                printf "==============================================================\n"
+                printf "Task: %s\n" "$d"
+                printf "==============================================================\n\n"
+            } >> lint.txt
 
-            read -r enter
-            exit 1
-        else
-            rm -f lint.txt
-
-            if [ -d testbenches ]
+            if [ -d "$d"testbenches ]
             then
-                verilator --lint-only      \
-                          -Wall            \
-                          --timing         \
-                          $lint_rules_path \
-                          -Itestbenches    \
-                          -Iblack_boxes    \
-                          testbenches/*.sv \
-                          ./*.sv           \
-                          -top tb          \
-                          >> lint.txt 2>&1
-
-            elif [ -f tb.sv ]
-            then
-                verilator --lint-only      \
-                          -Wall            \
-                          --timing         \
-                          $lint_rules_path \
-                          ./*.sv           \
-                          -top tb          \
-                          >> lint.txt 2>&1
+                extra_args="$extra_args
+                            -I$common_path/isqrt
+                            -I${d}testbenches
+                            -I${d}
+                            ${d}testbenches/*.sv
+                            ${d}*.sv
+                            -top tb"
             else
-                for d in */
-                do
-                    if [ ! -d "$d"testbenches ]
-                    then
-                        {
-                            printf "==============================================================\n"
-                            printf "Task: %s\n" "$d"
-                            printf "==============================================================\n\n"
-                        } >> lint.txt
+                if [ -f "$d"testbench.sv ] && grep -q "realtobits" "$d"testbench.sv;
+                then
+                    import_path=$(find_path "../import/preprocessed/cvw")
 
-                        verilator --lint-only      \
-                                  -Wall            \
-                                  --timing         \
-                                  $lint_rules_path \
-                                  "$d"*.sv         \
-                                  -top testbench   \
-                                  >> lint.txt 2>&1
+                    if [ "$import_path" = "none" ]
+                    then
+                        continue
                     fi
-                done
+
+                    if [ -d "$d"solution_submodules ]
+                    then
+                        extra_args="$extra_args
+                                    -I  ${d}solution_submodules
+                                    ${d}solution_submodules/*.sv"
+                    fi
+
+                    extra_args="$extra_args
+                                -I$import_path
+                                $import_path/config.vh
+                                -y $common_path/wally_fpu/*.sv
+                                -y $import_path/wally_fpu"
+                fi
+
+                extra_args="$extra_args
+                            ${d}*.sv
+                            -top testbench"
             fi
 
-            sed -i '/- Verilator:/d' lint.txt
-            sed -i '/- V e r i l a t i o n/d' lint.txt
-        fi
-    else
-        printf "%s\n"                                                             \
-               "ERROR [-l | --lint]: Verilator is not in the path"                \
-               "or cannot be run."                                                \
-               "See README.md file in the package directory for the instructions" \
-               "how to install Verilator."                                        \
-               "Press enter"
-
-        read -r enter
-        exit 1
+            run_verilator "$extra_args"
+        done
     fi
+
+    sed -i '/- Verilator:/d' lint.txt
+    sed -i '/- V e r i l a t i o n/d' lint.txt
 }
 
 #-----------------------------------------------------------------------------
@@ -194,6 +412,8 @@ run_assembly()
         rars_cmd="java -jar ../../bin/$rars_jar"
     fi
 
+    # $rars_args has to be unquoted in order to pass as multiple arguments
+    # shellcheck disable=SC2086
     if ! $rars_cmd $rars_args program.s >> log.txt 2>&1
     then
         printf "ERROR: assembly failed. See log.txt.\n"
@@ -236,6 +456,8 @@ open_waveform()
 }
 
 #-----------------------------------------------------------------------------
+# Main logic
+#-----------------------------------------------------------------------------
 
 if [ -f program.s ] ; then
     run_assembly
@@ -265,11 +487,11 @@ do
         ?)
             printf "ERROR: Unknown option\n"
             printf "Press enter\n"
+            # shellcheck disable=SC2034
             read -r enter
             exit 1;;
     esac
 done
 
-#-----------------------------------------------------------------------------
-
-grep -e PASS -e FAIL -e ERROR -e Error -e error -e Timeout -e ++ log.txt | sed -e 's/PASS/\x1b[0;32m&\x1b[0m/g' -e 's/FAIL/\x1b[0;31m&\x1b[0m/g'
+grep -e PASS -e FAIL -e ERROR -e Error -e error -e Timeout -e ++ log.txt \
+    | sed -e 's/PASS/\x1b[0;32m&\x1b[0m/g' -e 's/FAIL/\x1b[0;31m&\x1b[0m/g'
